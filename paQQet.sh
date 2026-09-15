@@ -289,8 +289,8 @@ install_core() {
 
 	chmod 755 "$tmp"
 	local ver_out=""
-	ver_out=$("$tmp" version 2>/dev/null | head -n1) || ver_out=""
-	[[ -z "$ver_out" ]] && ver_out=$("$tmp" --version 2>/dev/null | head -n1)
+	ver_out=$("$tmp" version 2>/dev/null | sed -n '1p') || ver_out=""
+	[[ -z "$ver_out" ]] && ver_out=$("$tmp" --version 2>/dev/null | sed -n '1p')
 
 	# Stop instances only for the few seconds needed to swap the binary.
 	if ((${#running[@]})); then
@@ -669,7 +669,9 @@ write_meta() { # write_meta <instance> <key=value>...
 }
 
 start_instance() { # start_instance <instance>
-	local inst="$1" svc="paqet@${inst}"
+	local inst="$1"
+	[[ -n "$inst" ]] || { log_err "start_instance called without an instance name"; return 1; }
+	local svc="paqet@${inst}"
 	systemctl enable "$svc" >/dev/null 2>&1 || true
 	systemctl restart "$svc" || true
 	sleep 3
@@ -1072,7 +1074,7 @@ fw_counter_in() { # fw_counter_in <remote_ip> <remote_port> -> inbound packet co
 run_diagnostics() {
 	echo -e "\n${BOLD}${BLUE}============== paQQet DIAGNOSTICS ==============${NC}" >&2
 	if [[ -x "$BIN_PATH" ]]; then
-		log_ok "core: $("$BIN_PATH" version 2>/dev/null | head -n1 || echo installed)"
+		log_ok "core: $("$BIN_PATH" version 2>/dev/null | sed -n '1p')"
 	else
 		log_err "core: paqet binary NOT installed"
 	fi
@@ -1490,7 +1492,8 @@ toggle_strict() {
 #-------------------------------------------------------------------------------
 show_banner() {
 	local core="not installed" ninst
-	[[ -x "$BIN_PATH" ]] && core="$("$BIN_PATH" version 2>/dev/null | head -n1 || echo installed)"
+	[[ -x "$BIN_PATH" ]] && core="$("$BIN_PATH" version 2>/dev/null | sed -n '1p')"
+	[[ -z "$core" ]] && core="installed"
 	ninst=$(instance_names | wc -l)
 	echo -e "${BOLD}${MAGENTA}" >&2
 	echo "  +-----------------------------------------------------------+" >&2
