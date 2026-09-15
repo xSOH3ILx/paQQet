@@ -15,7 +15,7 @@
 #===============================================================================
 set -o pipefail
 
-SCRIPT_VERSION="4.0.0"
+SCRIPT_VERSION="4.3.0"
 PAQET_REPO="hanselime/paqet"
 
 BIN_PATH="/usr/local/bin/paqet"
@@ -42,9 +42,12 @@ LB_SERVICE="/etc/systemd/system/paqqet-lb.service"
 DEF_EXIT_PORT="${PAQQET_EXIT_PORT:-9443}"      # high, non-standard port (docs: never 80/443/22)
 DEF_MTU="${PAQQET_MTU:-1350}"                  # paqet valid range 50-1500, safe default 1350
 DEF_CONN="${PAQQET_CONN:-4}"                   # parallel KCP links (1-256); client addr must be :0
-DEF_PROFILE="${PAQQET_PROFILE:-fast3}"
-DEF_WND="${PAQQET_WND:-2048}"                  # rcvwnd/sndwnd (1-32768)
+DEF_PROFILE="${PAQQET_PROFILE:-iran}"
+DEF_WND="${PAQQET_WND:-1024}"                  # rcvwnd/sndwnd (1-32768)
 DEF_BLOCK="${PAQQET_BLOCK:-aes}"
+SEL_BLOCK="${PAQQET_BLOCK:-aes}"      # selected cipher (menu / --block)
+PICKED_PROFILE=""; SUG_WND=""; SUG_CONN=""
+PICK_REMOTE=""; PICK_MTU=""; PICK_CONN=""; CHOOSE_FREE=0
 DEF_TCP_FLAG="${PAQQET_TCP_FLAG:-PA}"          # must be identical on both sides
 DEF_LB_BASE="${PAQQET_LB_BASE:-20000}"         # base port for loopback tunnel entries
 STRICT_FW="${PAQQET_STRICT_FW:-1}"             # 1 = also DROP tunnel packets in filter INPUT
@@ -123,7 +126,185 @@ valid_ipv4()  {
 	for n in "${o[@]}"; do (( n >= 0 && n <= 255 )) || return 1; done
 	return 0
 }
-valid_profile() { [[ "$1" =~ ^(normal|fast|fast2|fast3|lowlatency|bandwidth)$ ]]; }
+valid_profile() { [[ "$1" =~ ^(normal|fast|fast2|fast3|lowlatency|bandwidth|iran|iran-max|iran-game)$ ]]; }
+
+#-------------------------------------------------------------------------------
+# Numeric pickers: nothing has to be typed, every choice is a number.
+# choose <default_value> <title> <value|label|description>...
+#-------------------------------------------------------------------------------
+choose() {
+	local def="$1" title="$2"; shift 2
+	local item v l d ans i=1 n=$#
+	local -a vals=()
+	echo -e "\n${BOLD}${BLUE}${title}${NC}" >&2
+	for item in "$@"; do
+		IFS='|' read -r v l d <<< "$item"
+		vals+=("$v")
+		if [[ "$v" == "$def" ]]; then
+			printf '  %b%2d)%b %-11s %s %b<= current%b\n' "$BOLD" "$i" "$NC" "$l" "$d" "$GREEN" "$NC" >&2
+		else
+			printf '  %b%2d)%b %-11s %s\n' "$BOLD" "$i" "$NC" "$l" "$d" >&2
+		fi
+		i=$((i+1))
+	done
+	ans=$(ask "  Select 1-${n} (Enter = ${def}): " "")
+	[[ -z "$ans" ]] && { printf '%s\n' "$def"; return 0; }
+	if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= n )); then
+		printf '%s\n' "${vals[$((ans-1))]}"; return 0
+	fi
+	for v in "${vals[@]}"; do [[ "$ans" == "$v" ]] && { printf '%s\n' "$v"; return 0; }; done
+	if [[ "${CHOOSE_FREE:-0}" == "1" ]]; then printf '%s\n' "$ans"; return 0; fi
+	log_warn "Invalid choice '$ans' - using ${def}."
+	printf '%s\n' "$def"
+}
+
+# same as choose, but a typed value that is not in the list is accepted as-is
+choose_free() { CHOOSE_FREE=1; choose "$@"; CHOOSE_FREE=0; }
+
+profile_sug_wnd() {
+	case "$1" in
+		iran) echo 1024 ;;
+		iran-max) echo 2048 ;;
+		iran-game) echo 256 ;;
+		bandwidth) echo 2048 ;;
+		lowlatency) echo 512 ;;
+		*) echo "$DEF_WND" ;;
+	esac
+}
+
+profile_sug_conn() {
+	case "$1" in
+		iran) echo 4 ;;
+		iran-max) echo 8 ;;
+		iran-game) echo 2 ;;
+		*) echo "$DEF_CONN" ;;
+	esac
+}
+
+# pick_profile [default] -> sets PICKED_PROFILE, SUG_WND, SUG_CONN (call it directly,
+# not inside $( ), so the suggestions survive)
+pick_profile() {
+	local def="${1:-$DEF_PROFILE}"
+	PICKED_PROFILE=$(choose "$def" "KCP profile - how the tunnel engine paces packets" \
+		"iran|iran|balanced IR<->EU: good download AND upload, congestion control ON (recommended)" \
+		"iran-max|iran-max|max throughput for heavy downloads, ~10-20ms more latency" \
+		"iran-game|iran-game|lowest ping for gaming/voice, less throughput" \
+		"fast3|fast3|stock, most aggressive: floods a lossy line, speed often collapses" \
+		"fast2|fast2|stock, aggressive" \
+		"fast|fast|stock, moderate" \
+		"normal|normal|stock, gentle: lowest CPU and overhead" \
+		"lowlatency|lowlatency|manual preset: 10ms tick, congestion control OFF" \
+		"bandwidth|bandwidth|manual preset: bulk transfer, highest latency")
+	SUG_WND=$(profile_sug_wnd "$PICKED_PROFILE")
+	SUG_CONN=$(profile_sug_conn "$PICKED_PROFILE")
+	printf '%s\n' "$PICKED_PROFILE"
+}
+
+# pick_cipher [default] -> sets SEL_BLOCK (payload encryption; must match on both sides)
+pick_cipher() {
+	local def="${1:-${SEL_BLOCK:-$DEF_BLOCK}}"
+	SEL_BLOCK=$(choose "$def" "Tunnel encryption (same value required on both sides)" \
+		"aes|aes|AES-256: strongest, ~1-3% CPU with AES-NI (recommended)" \
+		"aes-128|aes-128|AES-128: same security class, faster on weak CPUs" \
+		"salsa20|salsa20|Salsa20: fastest on ARM / old CPUs, good security" \
+		"twofish|twofish|Twofish: alternative block cipher" \
+		"blowfish|blowfish|Blowfish: legacy, low CPU" \
+		"3des|3des|Triple DES: slow, compatibility only" \
+		"cast5|cast5|CAST5: legacy" \
+		"xor|xor|XOR: obfuscation only, NOT real encryption" \
+		"none|none|no encryption: fastest, payload readable on the wire")
+	printf '%s\n' "$SEL_BLOCK"
+}
+
+pick_proto() {
+	choose "${1:-tcp}" "Which protocol should be forwarded" \
+		"tcp|tcp|TCP only: panels, web, Xray TCP/WS/gRPC inbounds" \
+		"udp|udp|UDP only: WireGuard, QUIC/Hysteria, DNS, game traffic" \
+		"both|both|TCP + UDP on the same ports (two forward rules per port)"
+}
+
+pick_mtu() {
+	choose_free "${1:-$DEF_MTU}" "KCP MTU (the outer packet is ~40 bytes bigger)" \
+		"1350|1350|safe default, works on nearly every Iranian line" \
+		"1400|1400|slightly more efficient, needs a clean 1440+ path" \
+		"1300|1300|PPPoE / extra encapsulation on the way" \
+		"1200|1200|very lossy or mobile links, most robust"
+}
+
+pick_conn() {
+	choose_free "${1:-${SUG_CONN:-$DEF_CONN}}" "Parallel KCP connections (more = more speed, more CPU)" \
+		"1|1|single link, lowest CPU" \
+		"2|2|light usage" \
+		"4|4|balanced: one panel / small user group" \
+		"8|8|many users or heavy downloads" \
+		"16|16|busy hub, needs CPU headroom"
+}
+
+pick_wnd() {
+	local v
+	v=$(choose_free "${1:-${SUG_WND:-$DEF_WND}}" "KCP window in packets (in-flight buffer: too big = bufferbloat + loss)" \
+		"256|256|slow lines, snappiest latency" \
+		"512|512|up to ~50 Mbit at 100ms RTT" \
+		"1024|1024|~100 Mbit at 100ms RTT (recommended)" \
+		"2048|2048|200 Mbit+ or bulk downloads" \
+		"4096|4096|very fast links with plenty of RAM" \
+		"auto|auto|compute it from line speed + measured RTT")
+	[[ "$v" == "auto" ]] && v=$(auto_wnd)
+	printf '%s\n' "$v"
+}
+
+# auto_wnd -> window per connection from the bandwidth-delay product
+auto_wnd() {
+	local mbps rtt mtu conn bdp w
+	mbps=$(choose_free "100" "Line speed towards the exit server" \
+		"10|10 Mbit|ADSL or weak mobile" \
+		"30|30 Mbit|typical VDSL" \
+		"50|50 Mbit|good VDSL / FTTH" \
+		"100|100 Mbit|FTTH / datacenter" \
+		"200|200 Mbit|fast datacenter" \
+		"500|500 Mbit|premium datacenter" \
+		"1000|1000 Mbit|1 Gbit uplink")
+	rtt=""
+	if [[ -n "${PICK_REMOTE:-}" ]]; then
+		rtt=$(ping -c 3 -W 2 "$PICK_REMOTE" 2>/dev/null | awk -F'/' '/min\/avg|rtt|round-trip/ {print int($5)}' | tail -n1)
+		[[ -n "$rtt" ]] && log_info "measured RTT to ${PICK_REMOTE}: ${rtt} ms"
+	fi
+	if [[ -z "$rtt" || "$rtt" == "0" ]]; then
+		rtt=$(choose_free "100" "Round-trip time to the exit server (ms)" \
+			"40|40 ms|Turkey / UAE / nearby" \
+			"70|70 ms|Germany / Netherlands, good route" \
+			"100|100 ms|Europe, typical" \
+			"150|150 ms|congested Europe / US east" \
+			"220|220 ms|US west / Asia")
+	fi
+	mtu="${PICK_MTU:-$DEF_MTU}"; conn="${PICK_CONN:-$DEF_CONN}"
+	[[ "$mtu" =~ ^[0-9]+$ ]] || mtu="$DEF_MTU"
+	[[ "$conn" =~ ^[0-9]+$ ]] || conn="$DEF_CONN"
+	bdp=$(( mbps * 125000 * rtt / 1000 ))
+	w=$(( bdp * 2 / mtu / conn ))
+	(( w < 256 )) && w=256
+	(( w > 8192 )) && w=8192
+	log_info "auto window: ${mbps} Mbit, RTT ${rtt} ms, conn ${conn}, MTU ${mtu} -> ${w} packets per connection"
+	printf '%s\n' "$w"
+}
+
+# pick_instance [role] -> echoes the chosen instance name
+pick_instance() {
+	local want="${1:-}" n role
+	local -a names=() list=()
+	mapfile -t names < <(instance_names)
+	for n in "${names[@]}"; do
+		role=$(meta_get "$n" ROLE)
+		[[ -n "$want" && "$role" != "$want" ]] && continue
+		if [[ "$role" == "server" ]]; then
+			list+=("${n}|${n}|exit node, listening on :$(meta_get "$n" PORT)")
+		else
+			list+=("${n}|${n}|client -> $(meta_get "$n" REMOTE_IP):$(meta_get "$n" REMOTE_PORT) [$(meta_get "$n" PROFILE)]")
+		fi
+	done
+	((${#list[@]})) || { log_err "No matching instance found."; return 1; }
+	choose "${list[0]%%|*}" "Select an instance" "${list[@]}"
+}
 
 # port_in_use <port> [tcp|udp]  -> true if a *kernel socket* already listens
 port_in_use() {
@@ -613,9 +794,37 @@ EOF
 #-------------------------------------------------------------------------------
 # kcp_block <key> <mtu> <profile> <wnd>   (indented with 4 spaces, under transport.kcp)
 kcp_block() {
-	local key="$1" mtu="$2" prof="$3" wnd="$4"
+	local key="$1" mtu="$2" prof="$3" wnd="$4" blk="${SEL_BLOCK:-$DEF_BLOCK}"
 	echo "  kcp:"
 	case "$prof" in
+		iran)
+			# Custom IR<->EU balance: fast retransmit after 2 dup-ACKs, 20ms tick and
+			# congestion control ON, so the Iranian uplink is not self-flooded.
+			echo "    mode: \"manual\""
+			echo "    nodelay: 1"
+			echo "    interval: 20"
+			echo "    resend: 2"
+			echo "    nocongestion: 0"
+			echo "    wdelay: false"
+			echo "    acknodelay: false" ;;
+		iran-max)
+			# Throughput first: bigger tick + write delay batches more data per flush.
+			echo "    mode: \"manual\""
+			echo "    nodelay: 1"
+			echo "    interval: 30"
+			echo "    resend: 2"
+			echo "    nocongestion: 0"
+			echo "    wdelay: true"
+			echo "    acknodelay: false" ;;
+		iran-game)
+			# Latency first: 10ms tick, immediate ACKs, congestion control off.
+			echo "    mode: \"manual\""
+			echo "    nodelay: 1"
+			echo "    interval: 10"
+			echo "    resend: 2"
+			echo "    nocongestion: 1"
+			echo "    wdelay: false"
+			echo "    acknodelay: true" ;;
 		bandwidth)
 			echo "    mode: \"manual\""
 			echo "    nodelay: 0"
@@ -640,7 +849,7 @@ kcp_block() {
 	echo "    mtu: ${mtu}"
 	echo "    rcvwnd: ${wnd}"
 	echo "    sndwnd: ${wnd}"
-	echo "    block: \"${DEF_BLOCK}\""
+	echo "    block: \"${blk}\""
 	echo "    key: \"${key}\""
 	echo "    smuxbuf: 8388608"
 	echo "    streambuf: 4194304"
@@ -742,7 +951,7 @@ configure_server() {
 	chmod 600 "$cfg"
 	validate_yaml "$cfg" || return 1
 
-	write_meta "$name" "ROLE=server" "PORT=$port" "MTU=$mtu" "PROFILE=$prof" "CONN=$conn" "WND=$wnd" \
+	write_meta "$name" "ROLE=server" "PORT=$port" "MTU=$mtu" "PROFILE=$prof" "BLOCK=${SEL_BLOCK:-$DEF_BLOCK}" "CONN=$conn" "WND=$wnd" \
 		"IFACE=$DETECTED_IFACE" "LOCAL_IP=$DETECTED_IP" "PUBLIC_IP=$PUBLIC_IP" "KEY=$key"
 
 	install_service_template
@@ -757,6 +966,7 @@ configure_server() {
 	echo -e "  Remote Port : ${CYAN}${port}${NC}" >&2
 	echo -e "  Secret Key  : ${YELLOW}${key}${NC}" >&2
 	echo -e "  MTU/Profile : ${CYAN}${mtu} / ${prof}${NC}  (must match on both sides)" >&2
+	echo -e " Cipher      : ${CYAN}${SEL_BLOCK:-$DEF_BLOCK}${NC} (must match on both sides)" >&2
 	echo -e "${GREEN}==============================================================${NC}" >&2
 	log_warn "Open TCP/${port} inbound in your cloud provider firewall (SecurityGroup/NSG) too."
 	log_warn "Make sure your panel (3X-UI/Xray) listens on the target port you will forward to."
@@ -915,7 +1125,7 @@ configure_client() {
 
 	local lp_csv; lp_csv=$(IFS=,; echo "${local_ports[*]}")
 	write_meta "$name" "ROLE=client" "REMOTE_IP=$remote" "REMOTE_PORT=$rport" "LOCAL_PORTS=\"${lp_csv}\"" \
-		"SOCKS_PORT=${C_SOCKS}" "SOCKS_BIND=${socks_bind}" "BIND=$bind" "MTU=$mtu" "PROFILE=$prof" \
+		"SOCKS_PORT=${C_SOCKS}" "SOCKS_BIND=${socks_bind}" "BIND=$bind" "MTU=$mtu" "PROFILE=$prof" "BLOCK=${SEL_BLOCK:-$DEF_BLOCK}" \
 		"CONN=$conn" "WND=$wnd" "PROTO=$proto" "IFACE=$DETECTED_IFACE" "LOCAL_IP=$DETECTED_IP" "KEY=$key"
 
 	install_service_template
@@ -939,6 +1149,7 @@ client_wizard() {
 	C_NAME=$(ask "Instance name (e.g. de1, nl1): " "")
 	valid_name "$C_NAME" || { log_err "Invalid name."; return 1; }
 	C_REMOTE=$(ask "Exit server public IPv4: " "")
+	PICK_REMOTE="$C_REMOTE"
 	valid_ipv4 "$C_REMOTE" || { log_err "Invalid IPv4."; return 1; }
 	C_PORT=$(ask "Exit tunnel port [${DEF_EXIT_PORT}]: " "$DEF_EXIT_PORT")
 	C_KEY=$(ask "Secret key (from the exit node): " "")
@@ -946,7 +1157,7 @@ client_wizard() {
 
 	echo -e "\n  Port mappings. Examples:  ${CYAN}2053,8443${NC}   ${CYAN}8080>443${NC}   ${CYAN}9000>10.0.0.5:9000${NC}" >&2
 	C_PORTS=$(ask "Ports to tunnel (empty = SOCKS5 only): " "")
-	local p; p=$(ask "Protocol tcp / udp / both [tcp]: " "tcp")
+	local p; p=$(pick_proto "tcp")
 	case "$p" in tcp|udp|both) C_PROTO="$p" ;; *) C_PROTO="tcp" ;; esac
 	C_BIND=$(ask "Bind address for local listeners [0.0.0.0]: " "0.0.0.0")
 	if confirm "Also expose a SOCKS5 proxy?" "n"; then
@@ -954,11 +1165,13 @@ client_wizard() {
 		C_SOCKS_USER=$(ask "SOCKS5 username (empty = no auth, loopback only): " "")
 		[[ -n "$C_SOCKS_USER" ]] && C_SOCKS_PASS=$(ask_secret "SOCKS5 password: ")
 	fi
-	echo -e "\n  Profiles: ${CYAN}fast3${NC} (lossy IR links, default) | fast2 | fast | normal | lowlatency | bandwidth" >&2
-	C_PROF=$(ask "KCP profile [${DEF_PROFILE}]: " "$DEF_PROFILE")
-	C_MTU=$(ask "MTU [${DEF_MTU}]: " "$DEF_MTU")
-	C_CONN=$(ask "Parallel KCP connections [${DEF_CONN}]: " "$DEF_CONN")
-	C_WND=$(ask "KCP window (rcvwnd/sndwnd) [${DEF_WND}]: " "$DEF_WND")
+	pick_profile "$DEF_PROFILE" >/dev/null; C_PROF="$PICKED_PROFILE"
+	pick_cipher "${SEL_BLOCK:-$DEF_BLOCK}" >/dev/null
+	C_MTU=$(pick_mtu "$DEF_MTU")
+	PICK_MTU="$C_MTU"
+	C_CONN=$(pick_conn "${SUG_CONN:-$DEF_CONN}")
+	PICK_CONN="$C_CONN"
+	C_WND=$(pick_wnd "${SUG_WND:-$DEF_WND}")
 	configure_client
 }
 
@@ -972,12 +1185,13 @@ multi_exit_wizard() {
 	echo -e "\n${CYAN}Tip:${NC} to publish the SAME service port for all exits, leave the mapping empty here" >&2
 	echo -e "     and use menu option 12 (load balancer) to put HAProxy in front of the tunnels." >&2
 	shared_ports=$(ask "Service port on the EXIT side to tunnel (e.g. 2053), empty to ask per node: " "")
-	shared_proto=$(ask "Protocol for all nodes tcp/udp/both [tcp]: " "tcp")
+	shared_proto=$(pick_proto "tcp")
 	for ((i=1; i<=count; i++)); do
 		echo -e "\n${BOLD}${MAGENTA}===== Exit node ${i}/${count} =====${NC}" >&2
 		reset_client_vars
 		C_NAME=$(ask "Name [exit${i}]: " "exit${i}")
 		C_REMOTE=$(ask "Public IPv4: " "")
+		PICK_REMOTE="$C_REMOTE"
 		valid_ipv4 "$C_REMOTE" || { log_err "Invalid IPv4, skipping."; continue; }
 		C_PORT=$(ask "Tunnel port [${DEF_EXIT_PORT}]: " "$DEF_EXIT_PORT")
 		C_KEY=$(ask "Secret key: " "")
@@ -1053,6 +1267,7 @@ show_instance_key() {
 	echo -e "  peer   : $(meta_get "$inst" REMOTE_IP):$(meta_get "$inst" REMOTE_PORT)$(meta_get "$inst" PORT)" >&2
 	echo -e "  key    : ${YELLOW}$(meta_get "$inst" KEY)${NC}" >&2
 	echo -e "  mtu    : $(meta_get "$inst" MTU)   profile: $(meta_get "$inst" PROFILE)   conn: $(meta_get "$inst" CONN)" >&2
+	echo -e "  wnd    : $(meta_get "$inst" WND)   cipher: $(meta_get "$inst" BLOCK)" >&2
 }
 
 # Show panel/proxy ports listening on this box (useful on the exit node)
@@ -1130,7 +1345,7 @@ live_monitor() {
 	local names; mapfile -t names < <(instance_names)
 	((${#names[@]})) || { log_warn "No instances."; return 0; }
 	list_instances
-	local inst; inst=$(ask "Instance to monitor: " "${names[0]}")
+	local inst; inst=$(pick_instance)
 	[[ -f "$META_DIR/${inst}.meta" ]] || { log_err "Unknown instance."; return 1; }
 	echo -e "1) journal (live)\n2) tcpdump on the tunnel flow\n3) paqet dump (server role only)" >&2
 	local c; c=$(ask "Choice [1]: " "1")
@@ -1490,6 +1705,70 @@ toggle_strict() {
 #-------------------------------------------------------------------------------
 # Interactive menu
 #-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+# Re-tune an existing instance: profile / MTU / window / conn / cipher.
+# Only the transport part of the config is rewritten, keys and ports stay.
+#-------------------------------------------------------------------------------
+retune_instance() {
+	local inst="${1:-}"
+	if [[ -z "$inst" ]]; then inst=$(pick_instance) || return 1; fi
+	[[ -n "$inst" ]] || { log_err "No instance selected."; return 1; }
+	local cfg="$CONFIG_DIR/${inst}.yaml"
+	local meta="$META_DIR/${inst}.meta"
+	[[ -f "$cfg" && -f "$meta" ]] || { log_err "Unknown instance: $inst"; return 1; }
+
+	local cur_prof cur_mtu cur_wnd cur_conn cur_blk key
+	cur_prof=$(meta_get "$inst" PROFILE)
+	cur_mtu=$(meta_get "$inst" MTU)
+	cur_wnd=$(meta_get "$inst" WND)
+	cur_conn=$(meta_get "$inst" CONN)
+	cur_blk=$(meta_get "$inst" BLOCK)
+	key=$(meta_get "$inst" KEY)
+	[[ -n "$cur_blk" ]] && SEL_BLOCK="$cur_blk"
+	PICK_REMOTE=$(meta_get "$inst" REMOTE_IP)
+	log_info "current: profile=${cur_prof} mtu=${cur_mtu} window=${cur_wnd} conn=${cur_conn} cipher=${cur_blk:-$DEF_BLOCK}"
+
+	local prof mtu conn wnd
+	pick_profile "${cur_prof:-$DEF_PROFILE}" >/dev/null; prof="$PICKED_PROFILE"
+	pick_cipher "${cur_blk:-$DEF_BLOCK}" >/dev/null
+	mtu=$(pick_mtu "${cur_mtu:-$DEF_MTU}"); PICK_MTU="$mtu"
+	conn=$(pick_conn "${SUG_CONN:-${cur_conn:-$DEF_CONN}}"); PICK_CONN="$conn"
+	wnd=$(pick_wnd "${SUG_WND:-${cur_wnd:-$DEF_WND}}")
+
+	valid_profile "$prof" || { log_err "Invalid profile: $prof"; return 1; }
+	valid_mtu "$mtu" || { log_err "Invalid MTU: $mtu"; return 1; }
+	valid_conn "$conn" || { log_err "Invalid connection count: $conn"; return 1; }
+	valid_wnd "$wnd" || { log_err "Invalid window: $wnd"; return 1; }
+
+	cp -f "$cfg" "${cfg}.bak"
+	local tmp
+	tmp=$(mktemp) || return 1
+	# the kcp: block is always the tail of a generated config
+	sed -e "s/^  conn: .*/  conn: ${conn}/" "$cfg" | sed '/^  kcp:/,$d' > "$tmp"
+	kcp_block "$key" "$mtu" "$prof" "$wnd" >> "$tmp"
+	mv -f "$tmp" "$cfg"
+	chmod 600 "$cfg"
+	if ! validate_yaml "$cfg"; then
+		cp -f "${cfg}.bak" "$cfg"
+		log_err "The new config was rejected - rolled back, nothing changed."
+		return 1
+	fi
+
+	sed -i -e "s/^PROFILE=.*/PROFILE=${prof}/" -e "s/^MTU=.*/MTU=${mtu}/" \
+		-e "s/^WND=.*/WND=${wnd}/" -e "s/^CONN=.*/CONN=${conn}/" "$meta"
+	if grep -q '^BLOCK=' "$meta"; then
+		sed -i "s/^BLOCK=.*/BLOCK=${SEL_BLOCK:-$DEF_BLOCK}/" "$meta"
+	else
+		echo "BLOCK=${SEL_BLOCK:-$DEF_BLOCK}" >> "$meta"
+	fi
+	chmod 600 "$meta"
+
+	log_ok "${inst}: profile=${prof} mtu=${mtu} window=${wnd} conn=${conn} cipher=${SEL_BLOCK:-$DEF_BLOCK}"
+	start_instance "$inst" || return 1
+	log_warn "The peer side must use exactly the same profile, MTU, window, conn and cipher."
+	log_info "On the other server run:  paQQet retune ${inst}   (or menu option 19)"
+}
+
 show_banner() {
 	local core="not installed" ninst
 	[[ -x "$BIN_PATH" ]] && core="$("$BIN_PATH" version 2>/dev/null | sed -n '1p')"
@@ -1521,6 +1800,7 @@ menu() {
   13) DNS settings                  14) Backup / restore
   15) Show panel ports (3X-UI/Xray) 16) Remove an instance
   17) Toggle strict firewall mode   18) Uninstall everything
+  19) Re-tune an instance: profile / MTU / window / cipher
    0) Exit
 MEOF
 		local c; c=$(ask "$(echo -e "\n  ${BOLD}Choice:${NC} ")" "0")
@@ -1531,10 +1811,13 @@ MEOF
 				n=$(ask "Instance name [server]: " "server")
 				p=$(ask "Tunnel listen port [${DEF_EXIT_PORT}]: " "$DEF_EXIT_PORT")
 				k=$(ask "Secret key (empty = generate): " "")
-				pr=$(ask "KCP profile (fast3/fast2/fast/normal/lowlatency/bandwidth) [${DEF_PROFILE}]: " "$DEF_PROFILE")
-				m=$(ask "MTU [${DEF_MTU}]: " "$DEF_MTU")
-				cn=$(ask "Parallel KCP connections [${DEF_CONN}]: " "$DEF_CONN")
-				wd=$(ask "KCP window [${DEF_WND}]: " "$DEF_WND")
+				pick_profile "$DEF_PROFILE" >/dev/null; pr="$PICKED_PROFILE"
+				pick_cipher "${SEL_BLOCK:-$DEF_BLOCK}" >/dev/null
+				m=$(pick_mtu "$DEF_MTU")
+				PICK_MTU="$m"
+				cn=$(pick_conn "${SUG_CONN:-$DEF_CONN}")
+				PICK_CONN="$cn"
+				wd=$(pick_wnd "${SUG_WND:-$DEF_WND}")
 				configure_server "$n" "$p" "$k" "$m" "$pr" "$cn" "$wd" ;;
 			3) client_wizard ;;
 			4) multi_exit_wizard ;;
@@ -1553,6 +1836,7 @@ MEOF
 			15) xui_ports ;;
 			16) remove_instance ;;
 			17) toggle_strict ;;
+			19) retune_instance ;;
 			18) uninstall_all; exit 0 ;;
 			0) exit 0 ;;
 			*) log_warn "Invalid choice." ;;
@@ -1573,7 +1857,7 @@ Usage: paQQet <command> [options]
 Commands:
   install [version]              Install or update the paqet core (default: latest)
   server  [options]              Configure this host as an EXIT node
-    --name N --port P [--key K] [--mtu 1350] [--profile fast3] [--conn 4] [--wnd 2048]
+    --name N --port P [--key K] [--mtu 1350] [--profile iran] [--block aes] [--conn 4] [--wnd 2048]
   client  [options]              Add an exit tunnel on the Iran hub
     --name N --remote IP --port P --key K
     [--ports "2053,8080>443,9000>10.0.0.5:9000"] [--bind 0.0.0.0] [--proto tcp|udp|both]
@@ -1586,6 +1870,7 @@ Commands:
   lb                             Configure the HAProxy front-end
   backup | restore <file>        Backup or restore the configuration
   remove <instance>              Delete one instance
+  retune [name]                  Re-tune profile / MTU / window / cipher in place
   uninstall                      Remove everything
   version | help
 
@@ -1611,6 +1896,7 @@ cli_server() {
 			--key)     key="$2"; shift 2 ;;
 			--mtu)     mtu="$2"; shift 2 ;;
 			--profile) prof="$2"; shift 2 ;;
+			--block) SEL_BLOCK="$2"; shift 2 ;;
 			--conn)    conn="$2"; shift 2 ;;
 			--wnd)     wnd="$2"; shift 2 ;;
 			--yes|-y)  ASSUME_YES=1; shift ;;
@@ -1675,6 +1961,7 @@ main() {
 		backup)         backup_now ;;
 		restore)        restore_backup "${1:-}" ;;
 		remove)         remove_instance "${1:-}" ;;
+		retune)         retune_instance "${1:-}" ;;
 		uninstall)      uninstall_all ;;
 		key)            show_instance_key "${1:-}" ;;
 		version|-v|--version) echo "paQQet ${SCRIPT_VERSION}" ;;
