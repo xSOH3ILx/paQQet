@@ -15,7 +15,7 @@
 #===============================================================================
 set -o pipefail
 
-SCRIPT_VERSION="4.3.0"
+SCRIPT_VERSION="4.4.0"
 PAQET_REPO="hanselime/paqet"
 
 BIN_PATH="/usr/local/bin/paqet"
@@ -1769,6 +1769,823 @@ retune_instance() {
 	log_info "On the other server run:  paQQet retune ${inst}   (or menu option 19)"
 }
 
+#-------------------------------------------------------------------------------
+# AUTO-PILOT (4.4.0)
+#   probe this server + the route -> compute the best transport -> build it ->
+#   print the exact command needed on the other server.
+#-------------------------------------------------------------------------------
+AP_IFACE=""
+HW_CPU="unknown"; HW_CORES=1; HW_MEM=0; HW_AES=0; HW_VIRT="none"; HW_KERNEL=""
+HW_NIC_DRV="unknown"; HW_NIC_SPEED=0; HW_QDISC="unknown"; HW_BBR=0; HW_CAKE=0
+P_RTT=0; P_JIT=0; P_LOSS=0; P_MTU=0; P_ICMP=0; P_HOPS=0
+P_TCP_STATE="unknown"; P_TCP_MS=0; P_PORT_STATE="unknown"; P_UDP_STATE="unknown"
+BW_DOWN=0; BW_UP=0; BW_SRC="not measured"
+PLAN_PROFILE="$DEF_PROFILE"; PLAN_MTU="$DEF_MTU"; PLAN_WND="$DEF_WND"; PLAN_CONN="$DEF_CONN"
+PLAN_BLOCK="$DEF_BLOCK"; PLAN_PROTO="tcp"; PLAN_PURPOSE="balanced"
+declare -a PLAN_NOTES=()
+
+ap_note() { PLAN_NOTES+=("$1"); }
+ap_int() { local v="${1:-0}"; v="${v%%.*}"; v="${v//[^0-9]/}"; [[ -n "$v" ]] || v=0; printf '%s\n' "$v"; }
+ap_yn() { if (( ${1:-0} )); then echo yes; else echo no; fi; }
+
+# ap_choose <title> <default-value> <value|label|description>...
+ap_choose() {
+	local title="$1" def="$2"; shift 2
+	local item v l d ans i=1 n=$#
+	local -a vals=()
+	echo >&2
+	echo -e "${BOLD}${BLUE}${title}${NC}" >&2
+	for item in "$@"; do
+		IFS='|' read -r v l d <<< "$item"
+		vals+=("$v")
+		if [[ "$v" == "$def" ]]; then
+			printf '  %b%2d)%b %-13s %s %b<= default%b\n' "$BOLD" "$i" "$NC" "$l" "$d" "$GREEN" "$NC" >&2
+		else
+			printf '  %b%2d)%b %-13s %s\n' "$BOLD" "$i" "$NC" "$l" "$d" >&2
+		fi
+		i=$(( i + 1 ))
+	done
+	ans=$(ask "  Select 1-${n} (Enter = ${def}): " "")
+	[[ -z "$ans" ]] && { printf '%s\n' "$def"; return 0; }
+	if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= n )); then
+		printf '%s\n' "${vals[$(( ans - 1 ))]}"; return 0
+	fi
+	for v in "${vals[@]}"; do [[ "$ans" == "$v" ]] && { printf '%s\n' "$v"; return 0; }; done
+	printf '%s\n' "$def"
+}
+
+#--- 1. hardware, kernel, NIC --------------------------------------------------
+hw_probe() {
+	local s
+	HW_CPU=$(awk -F: '/^model name/ { gsub(/^ +/, "", $2); print $2; exit }' /proc/cpuinfo 2>/dev/null)
+	[[ -n "$HW_CPU" ]] || HW_CPU=$(uname -m)
+	HW_CORES=$(nproc 2>/dev/null || echo 1)
+	[[ "$HW_CORES" =~ ^[0-9]+$ ]] || HW_CORES=1
+	HW_MEM=$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo 2>/dev/null)
+	[[ "$HW_MEM" =~ ^[0-9]+$ ]] || HW_MEM=0
+	if grep -qiE '^flags.*[[:space:]]aes([[:space:]]|$)' /proc/cpuinfo 2>/dev/null; then HW_AES=1; else HW_AES=0; fi
+	HW_KERNEL=$(uname -r 2>/dev/null)
+	HW_VIRT="none"
+	have systemd-detect-virt && HW_VIRT=$(systemd-detect-virt 2>/dev/null || echo none)
+	AP_IFACE="${DETECTED_IFACE:-}"
+	[[ -n "$AP_IFACE" ]] || AP_IFACE=$(ip -o route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+	if [[ -n "$AP_IFACE" ]]; then
+		HW_NIC_DRV=$(basename "$(readlink -f "/sys/class/net/${AP_IFACE}/device/driver" 2>/dev/null)" 2>/dev/null)
+		[[ -n "$HW_NIC_DRV" && "$HW_NIC_DRV" != "." && "$HW_NIC_DRV" != "/" ]] || HW_NIC_DRV="unknown"
+		s=$(cat "/sys/class/net/${AP_IFACE}/speed" 2>/dev/null)
+		if [[ "$s" =~ ^[0-9]+$ ]]; then HW_NIC_SPEED=$s; else HW_NIC_SPEED=0; fi
+		HW_QDISC=$(tc qdisc show dev "$AP_IFACE" 2>/dev/null | awk 'NR == 1 { print $2 }')
+		[[ -n "$HW_QDISC" ]] || HW_QDISC="unknown"
+	fi
+	if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+		HW_BBR=1
+	elif modprobe tcp_bbr >/dev/null 2>&1; then
+		HW_BBR=1
+	fi
+	if grep -q '^sch_cake' /proc/modules 2>/dev/null || modinfo sch_cake >/dev/null 2>&1; then HW_CAKE=1; fi
+	case "$HW_VIRT" in
+		openvz|lxc|lxc-libvirt|docker|podman)
+			ap_note "Virtualization is ${HW_VIRT}: raw packet capture/injection normally does not work there, KVM or bare metal is needed." ;;
+	esac
+	(( HW_MEM > 0 && HW_MEM < 700 )) && ap_note "Only ${HW_MEM} MB RAM: the window is kept small on purpose so the tunnel cannot be OOM-killed."
+	if [[ -n "$AP_IFACE" ]] && ! ip -o link show dev "$AP_IFACE" 2>/dev/null | grep -q 'link/ether'; then
+		ap_note "Interface ${AP_IFACE} has no MAC address (ppp/tun/venet): paqet builds Ethernet frames and cannot use it."
+	fi
+	return 0
+}
+
+#--- 2. the route --------------------------------------------------------------
+# mtu_probe <ip> -> largest working path MTU (0 = ICMP filtered)
+mtu_probe() {
+	local ip="$1" lo=1000 hi=1472 mid best=0
+	ping -n -M do -c 1 -W 2 -s 1472 "$ip" >/dev/null 2>&1 && { echo 1500; return 0; }
+	ping -n -c 1 -W 2 "$ip" >/dev/null 2>&1 || { echo 0; return 0; }
+	while (( lo <= hi )); do
+		mid=$(( (lo + hi) / 2 ))
+		if ping -n -M do -c 1 -W 2 -s "$mid" "$ip" >/dev/null 2>&1; then
+			best=$mid; lo=$(( mid + 1 ))
+		else
+			hi=$(( mid - 1 ))
+		fi
+	done
+	if (( best > 0 )); then echo $(( best + 28 )); else echo 0; fi
+}
+
+# tcp_probe <ip> <port> -> "open <ms>" | "closed <ms>" | "filtered <ms>"
+tcp_probe() {
+	local ip="$1" port="$2" t0 t1 ms
+	t0=$(date +%s%N 2>/dev/null); [[ "$t0" =~ ^[0-9]+$ ]] || t0=0
+	if timeout 4 bash -c "exec 3<>/dev/tcp/${ip}/${port}" >/dev/null 2>&1; then
+		t1=$(date +%s%N); ms=$(( (t1 - t0) / 1000000 ))
+		echo "open $ms"; return 0
+	fi
+	t1=$(date +%s%N); ms=$(( (t1 - t0) / 1000000 ))
+	if (( ms < 2500 )); then echo "closed $ms"; else echo "filtered $ms"; fi
+}
+
+# path_probe <peer-ip> <tunnel-port>
+path_probe() {
+	local ip="$1" port="$2" out line rtt st ms p
+	P_RTT=0; P_JIT=0; P_LOSS=0; P_MTU=0; P_ICMP=0; P_HOPS=0
+	P_TCP_STATE="unknown"; P_TCP_MS=0; P_PORT_STATE="unknown"; P_UDP_STATE="unknown"
+	log_info "Probing the route to ${ip} (20 pings, MTU discovery, TCP/UDP reachability)..."
+	out=$(ping -n -c 20 -i 0.2 -W 2 "$ip" 2>/dev/null)
+	if [[ -n "$out" ]]; then
+		p=$(grep -oE '[0-9]+(\.[0-9]+)?% packet loss' <<< "$out" | grep -oE '^[0-9]+(\.[0-9]+)?' | head -n1)
+		[[ -n "$p" ]] && P_LOSS=$(ap_int "$p")
+		line=$(grep -E 'min/avg/max' <<< "$out" | tail -n1)
+		if [[ -n "$line" ]]; then
+			rtt="${line##*= }"; rtt="${rtt% ms}"
+			P_RTT=$(ap_int "$(cut -d/ -f2 <<< "$rtt")")
+			P_JIT=$(ap_int "$(cut -d/ -f4 <<< "$rtt")")
+			P_ICMP=1
+		fi
+	fi
+	read -r st ms <<< "$(tcp_probe "$ip" "$port")"
+	P_PORT_STATE="$st"
+	for p in 22 80 443; do
+		read -r st ms <<< "$(tcp_probe "$ip" "$p")"
+		if [[ "$st" == "open" ]]; then
+			P_TCP_STATE="reachable (tcp/${p})"; P_TCP_MS="$ms"; break
+		elif [[ "$st" == "closed" ]]; then
+			P_TCP_STATE="reachable (rst on tcp/${p})"; P_TCP_MS="$ms"; break
+		fi
+		P_TCP_STATE="filtered"
+	done
+	if (( P_ICMP == 0 )); then
+		ap_note "ICMP is filtered on this route, so RTT comes from the TCP handshake and the MTU cannot be probed."
+		[[ "$P_TCP_MS" =~ ^[0-9]+$ ]] && (( P_TCP_MS > 0 )) && { P_RTT=$P_TCP_MS; P_LOSS=0; }
+	fi
+	P_MTU=$(mtu_probe "$ip")
+	if have dig; then
+		if timeout 4 dig +time=2 +tries=1 +short @1.1.1.1 example.com >/dev/null 2>&1; then P_UDP_STATE="egress OK (udp/53)"; else P_UDP_STATE="blocked/filtered"; fi
+	elif have nslookup; then
+		if timeout 4 nslookup example.com 1.1.1.1 >/dev/null 2>&1; then P_UDP_STATE="egress OK (udp/53)"; else P_UDP_STATE="blocked/filtered"; fi
+	fi
+	if have tracepath; then
+		P_HOPS=$(timeout 25 tracepath -n -m 20 "$ip" 2>/dev/null | grep -cE '^[[:space:]]*[0-9]+:')
+	elif have traceroute; then
+		P_HOPS=$(timeout 25 traceroute -n -w 1 -q 1 -m 20 "$ip" 2>/dev/null | grep -cE '^[[:space:]]*[0-9]+')
+	fi
+	[[ "$P_HOPS" =~ ^[0-9]+$ ]] || P_HOPS=0
+	(( P_LOSS >= 15 )) && ap_note "Packet loss is ${P_LOSS}%: this route is unstable, a second exit or provider is worth testing."
+	(( P_JIT >= 40 )) && ap_note "Jitter is ${P_JIT} ms: the path is congested, aggressive profiles would make it worse."
+	[[ "$P_PORT_STATE" == "open" ]] && ap_note "TCP/${port} already has a real listener on the peer: pick another tunnel port, a raw tunnel must not share it."
+	[[ "$P_TCP_STATE" == "filtered" ]] && ap_note "No TCP answer at all from ${ip}: check the provider firewall before blaming the tunnel."
+	return 0
+}
+
+#--- 3. bandwidth --------------------------------------------------------------
+ap_iperf_mbps() {
+	awk '/receiver/ { for (i = 1; i <= NF; i++) if ($i ~ /bits\/sec/) { v = $(i - 1) + 0; u = $i; if (u ~ /^G/) v = v * 1000; else if (u ~ /^K/) v = v / 1000; printf "%d\n", v + 0.5 } }' | tail -n1
+}
+
+ap_curl_down() {
+	local urls=("https://speed.cloudflare.com/__down?bytes=50000000" "https://proof.ovh.net/files/100Mb.dat" "http://speedtest.tele2.net/100MB.zip") u sp best=0
+	for u in "${urls[@]}"; do
+		sp=$(curl -fsS -o /dev/null --max-time 15 -w '%{speed_download}' "$u" 2>/dev/null)
+		sp=$(ap_int "${sp:-0}")
+		(( sp > best )) && best=$sp
+		(( best > 0 )) && break
+	done
+	echo $(( best * 8 / 1000000 ))
+}
+
+ap_curl_up() {
+	local sp
+	sp=$(head -c 20000000 /dev/zero 2>/dev/null | curl -fsS -o /dev/null --max-time 15 -w '%{speed_upload}' -X POST --data-binary @- "https://speed.cloudflare.com/__up" 2>/dev/null)
+	sp=$(ap_int "${sp:-0}")
+	echo $(( sp * 8 / 1000000 ))
+}
+
+bw_probe() {
+	local ip="${1:-}" how down up
+	how=$(ap_choose "How should the line speed be measured?" "internet" \
+		"iperf3|iperf3|most accurate: needs 'iperf3 -s' running on the other server" \
+		"internet|internet test|download + upload against public speed servers" \
+		"manual|I know it|type the values your provider promises" \
+		"skip|skip|use the NIC link speed / safe defaults")
+	case "$how" in
+		iperf3)
+			if have iperf3 && [[ -n "$ip" ]]; then
+				log_info "iperf3 download test against ${ip}..."
+				down=$(timeout 40 iperf3 -c "$ip" -t 6 -P 4 -R 2>/dev/null | ap_iperf_mbps)
+				log_info "iperf3 upload test against ${ip}..."
+				up=$(timeout 40 iperf3 -c "$ip" -t 6 -P 4 2>/dev/null | ap_iperf_mbps)
+				BW_DOWN=$(ap_int "${down:-0}"); BW_UP=$(ap_int "${up:-0}"); BW_SRC="iperf3 to ${ip}"
+			else
+				log_warn "iperf3 is not installed here, or no peer IP was given."
+			fi
+			;;
+		internet)
+			log_info "Measuring the download speed (about 15 s)..."
+			BW_DOWN=$(ap_int "$(ap_curl_down)")
+			log_info "Measuring the upload speed (about 15 s)..."
+			BW_UP=$(ap_int "$(ap_curl_up)")
+			BW_SRC="internet speed test"
+			(( BW_DOWN == 0 )) && log_warn "The speed test failed (no internet or blocked), please enter the values."
+			;;
+	esac
+	if (( BW_DOWN <= 0 )); then
+		BW_DOWN=$(ap_int "$(ap_choose "Download speed of THIS server (Mbit/s)" "100" \
+			"10|10 Mbit|ADSL or weak mobile" \
+			"25|25 Mbit|VDSL" \
+			"50|50 Mbit|good VDSL / FTTH" \
+			"100|100 Mbit|FTTH or datacenter, typical" \
+			"200|200 Mbit|fast datacenter" \
+			"500|500 Mbit|premium datacenter" \
+			"1000|1000 Mbit|1 Gbit uplink")")
+		BW_SRC="entered by hand"
+	fi
+	if (( BW_UP <= 0 )); then
+		BW_UP=$(ap_int "$(ap_choose "Upload speed of THIS server (Mbit/s)" "$BW_DOWN" \
+			"5|5 Mbit|typical Iranian ADSL upload" \
+			"10|10 Mbit|VDSL upload" \
+			"50|50 Mbit|FTTH upload" \
+			"100|100 Mbit|symmetric 100 Mbit" \
+			"200|200 Mbit|fast datacenter" \
+			"500|500 Mbit|premium datacenter" \
+			"1000|1000 Mbit|1 Gbit uplink" \
+			"${BW_DOWN}|same as download|symmetric line")")
+	fi
+	if (( HW_NIC_SPEED > 0 && BW_DOWN > HW_NIC_SPEED )); then
+		ap_note "The NIC link is only ${HW_NIC_SPEED} Mbit, so ${BW_DOWN} Mbit cannot be reached: capped."
+		BW_DOWN=$HW_NIC_SPEED
+	fi
+	(( BW_UP > 0 && BW_DOWN > BW_UP * 5 )) && ap_note "Upload (${BW_UP}) is far below download (${BW_DOWN}): ACKs travel upstream, so the window is sized from the upload."
+	return 0
+}
+
+#--- 4. the planner ------------------------------------------------------------
+plan_config() {
+	local eff bdp safety w need cap mtu rtt
+	PLAN_PURPOSE=$(ap_choose "What matters most on this tunnel?" "balanced" \
+		"balanced|balanced|good speed with a sane ping - best for mixed use (web, video, apps)" \
+		"download|throughput|maximum download/upload, the ping may rise a little" \
+		"latency|low ping|gaming, VoIP, SSH, trading - speed is secondary")
+	case "$PLAN_PURPOSE" in
+		latency)  PLAN_PROFILE="iran-game" ;;
+		download) if (( P_LOSS >= 3 )); then PLAN_PROFILE="iran"; else PLAN_PROFILE="iran-max"; fi ;;
+		*)        PLAN_PROFILE="iran" ;;
+	esac
+	if [[ "$PLAN_PROFILE" == "iran-game" ]] && (( P_LOSS >= 5 )); then
+		PLAN_PROFILE="iran"
+		ap_note "Loss is ${P_LOSS}%: the no-congestion profile would flood the path, so the balanced profile is used."
+	fi
+	if [[ "$PLAN_PROFILE" == "iran-max" ]] && (( P_JIT >= 40 )); then
+		PLAN_PROFILE="iran"
+		ap_note "Jitter is ${P_JIT} ms: the aggressive profile is replaced by the balanced one."
+	fi
+	if (( P_MTU >= 1280 )); then
+		mtu=$(( P_MTU - 100 ))
+	elif (( P_MTU > 0 )); then
+		mtu=$(( P_MTU - 60 ))
+		ap_note "Path MTU is only ${P_MTU} bytes (PPPoE or another tunnel in the path)."
+	else
+		mtu=1400
+		ap_note "Path MTU could not be probed, so the safe value 1400 is used."
+	fi
+	(( P_LOSS >= 3 )) && mtu=$(( mtu - 50 ))
+	(( mtu > 1400 )) && mtu=1400
+	(( mtu < 1200 )) && mtu=1200
+	PLAN_MTU=$(( mtu / 10 * 10 ))
+	eff=$BW_DOWN
+	(( BW_UP > 0 && BW_UP * 8 < eff )) && eff=$(( BW_UP * 8 ))
+	(( eff <= 0 )) && eff=100
+	if   (( eff >= 600 && HW_CORES >= 8 )); then PLAN_CONN=16
+	elif (( eff >= 300 && HW_CORES >= 4 )); then PLAN_CONN=8
+	elif (( eff >= 100 && HW_CORES >= 2 )); then PLAN_CONN=4
+	else PLAN_CONN=2
+	fi
+	[[ "$PLAN_PURPOSE" == "latency" ]] && PLAN_CONN=2
+	if (( P_LOSS >= 5 && PLAN_CONN > 2 )); then
+		PLAN_CONN=2
+		ap_note "With ${P_LOSS}% loss fewer streams retransmit less, so conn is limited to 2."
+	fi
+	(( HW_CORES <= 1 )) && PLAN_CONN=2
+	(( PLAN_CONN > HW_CORES * 4 )) && PLAN_CONN=$(( HW_CORES * 4 ))
+	rtt=$P_RTT
+	if (( rtt <= 0 )); then rtt=60; ap_note "RTT was not measured, 60 ms is assumed for the window calculation."; fi
+	bdp=$(( eff * 125 * rtt ))
+	safety=200
+	[[ "$PLAN_PURPOSE" == "download" ]] && safety=250
+	[[ "$PLAN_PURPOSE" == "latency" ]] && safety=100
+	(( P_LOSS >= 3 )) && safety=$(( safety - 80 ))
+	(( safety < 100 )) && safety=100
+	w=$(( bdp * safety / 100 / PLAN_MTU / PLAN_CONN ))
+	(( w < 128 )) && w=128
+	if (( HW_MEM > 0 )); then
+		cap=$(( HW_MEM * 1024 * 1024 / 4 ))
+		while (( w > 128 )); do
+			need=$(( w * PLAN_MTU * PLAN_CONN * 2 ))
+			(( need <= cap )) && break
+			w=$(( w / 2 ))
+			[[ " ${PLAN_NOTES[*]} " == *"limited by RAM"* ]] || ap_note "The window is limited by RAM (${HW_MEM} MB) so the tunnel cannot trigger an OOM kill."
+		done
+	fi
+	if   (( w <= 192 ));   then PLAN_WND=128
+	elif (( w <= 320 ));   then PLAN_WND=256
+	elif (( w <= 768 ));   then PLAN_WND=512
+	elif (( w <= 1536 ));  then PLAN_WND=1024
+	elif (( w <= 3072 ));  then PLAN_WND=2048
+	elif (( w <= 6144 ));  then PLAN_WND=4096
+	elif (( w <= 12288 )); then PLAN_WND=8192
+	elif (( w <= 24576 )); then PLAN_WND=16384
+	else PLAN_WND=32768
+	fi
+	if [[ "$PLAN_PURPOSE" == "latency" ]] && (( PLAN_WND > 1024 )); then
+		PLAN_WND=1024
+		ap_note "For low ping the window stays small on purpose: a huge window means bufferbloat."
+	fi
+	if (( HW_AES == 1 )); then
+		PLAN_BLOCK="aes"
+	else
+		PLAN_BLOCK="salsa20"
+		ap_note "This CPU has no AES-NI, so salsa20 is used - much faster in software."
+	fi
+	return 0
+}
+
+ap_report() {
+	local i
+	echo
+	echo -e "${BOLD}${BLUE}=============== AUTO-PILOT REPORT ===============${NC}"
+	echo -e "${BOLD}Server${NC}"
+	printf "  %-14s %s\n" "CPU" "${HW_CPU} (${HW_CORES} core/s)"
+	printf "  %-14s %s\n" "AES-NI" "$(ap_yn "$HW_AES")"
+	printf "  %-14s %s\n" "RAM" "${HW_MEM} MB"
+	printf "  %-14s %s\n" "Virtualization" "${HW_VIRT}"
+	printf "  %-14s %s\n" "Kernel" "${HW_KERNEL}"
+	printf "  %-14s %s\n" "NIC" "${AP_IFACE} / ${HW_NIC_DRV} / link ${HW_NIC_SPEED} Mbit / qdisc ${HW_QDISC}"
+	printf "  %-14s %s\n" "BBR + CAKE" "$(ap_yn "$HW_BBR") + $(ap_yn "$HW_CAKE")"
+	echo -e "${BOLD}Route to the peer${NC}"
+	printf "  %-14s %s\n" "RTT / jitter" "${P_RTT} ms / ${P_JIT} ms"
+	printf "  %-14s %s\n" "Packet loss" "${P_LOSS} %"
+	printf "  %-14s %s\n" "Path MTU" "${P_MTU}"
+	printf "  %-14s %s\n" "Tunnel port" "${P_PORT_STATE} (closed or filtered is the healthy answer)"
+	printf "  %-14s %s\n" "TCP" "${P_TCP_STATE}"
+	printf "  %-14s %s\n" "UDP egress" "${P_UDP_STATE}"
+	printf "  %-14s %s\n" "Hops" "${P_HOPS}"
+	echo -e "${BOLD}Bandwidth${NC}"
+	printf "  %-14s %s\n" "Down / Up" "${BW_DOWN} / ${BW_UP} Mbit  (${BW_SRC})"
+	echo -e "${BOLD}Transport chosen for you${NC}"
+	printf "  %-14s %s\n" "Goal" "${PLAN_PURPOSE}"
+	printf "  %-14s %s\n" "Profile" "${PLAN_PROFILE}"
+	printf "  %-14s %s\n" "MTU" "${PLAN_MTU}"
+	printf "  %-14s %s\n" "conn" "${PLAN_CONN}"
+	printf "  %-14s %s\n" "window" "${PLAN_WND}"
+	printf "  %-14s %s\n" "cipher" "${PLAN_BLOCK}"
+	printf "  %-14s %s\n" "protocol" "${PLAN_PROTO}"
+	if (( ${#PLAN_NOTES[@]} )); then
+		echo -e "${BOLD}${YELLOW}What I noticed${NC}"
+		for i in "${!PLAN_NOTES[@]}"; do echo "  $(( i + 1 )). ${PLAN_NOTES[$i]}"; done
+	fi
+	echo -e "${BOLD}${BLUE}=================================================${NC}"
+}
+
+#--- 5. deep Linux / NIC optimization -----------------------------------------
+DEEP_SYSCTL="/etc/sysctl.d/99-paqqet-deep.conf"
+NIC_SCRIPT="/usr/local/bin/paqqet-nic.sh"
+NIC_ENV="/etc/paqet/nic.env"
+NIC_SERVICE="/etc/systemd/system/paqqet-nic.service"
+PAQET_DROPIN="/etc/systemd/system/paqet@.service.d"
+
+deep_optimize() {
+	local mbps="${1:-0}" iface="${2:-}" mem=67108864 cc=""
+	need_root
+	[[ "$mbps" =~ ^[0-9]+$ ]] || mbps=0
+	(( HW_CORES <= 1 )) && hw_probe
+	[[ -n "$iface" ]] || iface="${AP_IFACE:-${DETECTED_IFACE:-}}"
+	[[ -n "$iface" ]] || iface=$(ip -o route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+	if (( mbps == 0 )); then
+		mbps=$(ap_int "$(ap_choose "Line speed of this server (used to shape the queue)" "100" \
+			"0|unknown|no shaping, only fq_codel" \
+			"50|50 Mbit|" \
+			"100|100 Mbit|" \
+			"200|200 Mbit|" \
+			"500|500 Mbit|" \
+			"1000|1 Gbit|")")
+	fi
+	(( mbps >= 500 )) && mem=134217728
+	(( HW_BBR == 1 )) && cc="net.ipv4.tcp_congestion_control = bbr"
+	log_info "Writing the kernel tuning to ${DEEP_SYSCTL}..."
+	mkdir -p "$(dirname "$DEEP_SYSCTL")" 2>/dev/null || true
+	cat > "$DEEP_SYSCTL" << SYSEOF
+# paQQet deep tuning - generated $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# sized for ~${mbps} Mbit, ${HW_CORES} core/s, ${HW_MEM} MB RAM
+net.core.rmem_max = ${mem}
+net.core.wmem_max = ${mem}
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.core.optmem_max = 262144
+net.core.netdev_max_backlog = 65536
+net.core.netdev_budget = 600
+net.core.netdev_budget_usecs = 8000
+net.core.somaxconn = 65535
+net.core.default_qdisc = fq
+${cc}
+net.ipv4.tcp_rmem = 4096 262144 ${mem}
+net.ipv4.tcp_wmem = 4096 262144 ${mem}
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_notsent_lowat = 131072
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_retries2 = 8
+net.ipv4.ip_local_port_range = 10240 65000
+net.ipv4.ip_forward = 1
+fs.file-max = 2097152
+fs.nr_open = 2097152
+vm.swappiness = 10
+vm.dirty_ratio = 20
+vm.dirty_background_ratio = 5
+SYSEOF
+	sysctl --system >/dev/null 2>&1 || sysctl -p "$DEEP_SYSCTL" >/dev/null 2>&1 || true
+	mkdir -p /etc/modules-load.d 2>/dev/null || true
+	printf 'tcp_bbr\nnf_conntrack\nsch_cake\n' > /etc/modules-load.d/99-paqqet-deep.conf 2>/dev/null || true
+	log_info "Writing the NIC tuning script to ${NIC_SCRIPT}..."
+	mkdir -p "$(dirname "$NIC_SCRIPT")" 2>/dev/null || true
+	cat > "$NIC_SCRIPT" << 'NICEOF'
+#!/usr/bin/env bash
+# paQQet NIC tuning - executed at boot by paqqet-nic.service
+[[ -f /etc/paqet/nic.env ]] && . /etc/paqet/nic.env
+IF="${PAQQET_NIC_IFACE:-}"
+MBPS="${PAQQET_NIC_MBPS:-0}"
+CAKE="${PAQQET_NIC_CAKE:-0}"
+[[ -n "$IF" ]] || IF=$(ip -o route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+[[ -n "$IF" && -d "/sys/class/net/${IF}" ]] || exit 0
+
+# paqet reads raw frames with pcap: coalescing hides packets, so GRO/LRO must be off
+ethtool -K "$IF" gro off lro off 2>/dev/null
+
+# biggest ring buffers the NIC offers -> fewer drops during bursts
+RX=$(ethtool -g "$IF" 2>/dev/null | awk '/^Pre-set maximums:/, /^Current/ { if ($1 == "RX:") { print $2; exit } }')
+TX=$(ethtool -g "$IF" 2>/dev/null | awk '/^Pre-set maximums:/, /^Current/ { if ($1 == "TX:") { print $2; exit } }')
+[[ "$RX" =~ ^[0-9]+$ ]] && ethtool -G "$IF" rx "$RX" 2>/dev/null
+[[ "$TX" =~ ^[0-9]+$ ]] && ethtool -G "$IF" tx "$TX" 2>/dev/null
+ethtool -C "$IF" adaptive-rx on 2>/dev/null
+ip link set dev "$IF" txqueuelen 10000 2>/dev/null
+
+# queue discipline: shaped cake kills bufferbloat, fq_codel is the fallback
+Q=""
+if [[ "$CAKE" == "1" && "$MBPS" =~ ^[0-9]+$ ]] && (( MBPS > 0 )); then
+	tc qdisc replace dev "$IF" root cake bandwidth $(( MBPS * 95 / 100 ))mbit besteffort ack-filter 2>/dev/null && Q=cake
+fi
+if [[ -z "$Q" ]]; then
+	tc qdisc replace dev "$IF" root fq_codel 2>/dev/null && Q=fq_codel
+fi
+[[ -z "$Q" ]] && tc qdisc replace dev "$IF" root fq 2>/dev/null
+
+# spread packet processing over all cores (RPS/XPS) - matters a lot on a 1-2 core VPS
+CORES=$(nproc 2>/dev/null || echo 1)
+MASK=$(printf '%x' $(( (1 << CORES) - 1 )))
+for q in /sys/class/net/${IF}/queues/rx-*; do
+	[[ -w "${q}/rps_cpus" ]] && echo "$MASK" > "${q}/rps_cpus" 2>/dev/null
+	[[ -w "${q}/rps_flow_cnt" ]] && echo 4096 > "${q}/rps_flow_cnt" 2>/dev/null
+done
+for q in /sys/class/net/${IF}/queues/tx-*; do
+	[[ -w "${q}/xps_cpus" ]] && echo "$MASK" > "${q}/xps_cpus" 2>/dev/null
+done
+[[ -w /proc/sys/net/core/rps_sock_flow_entries ]] && echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null
+
+# no CPU frequency scaling in the middle of a transfer
+for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+	[[ -w "$g" ]] && echo performance > "$g" 2>/dev/null
+done
+exit 0
+NICEOF
+	chmod +x "$NIC_SCRIPT"
+	mkdir -p "$(dirname "$NIC_ENV")" 2>/dev/null || true
+	cat > "$NIC_ENV" << ENVEOF
+PAQQET_NIC_IFACE="${iface}"
+PAQQET_NIC_MBPS="${mbps}"
+PAQQET_NIC_CAKE="${HW_CAKE}"
+ENVEOF
+	cat > "$NIC_SERVICE" << UNITEOF
+[Unit]
+Description=paQQet NIC and queue tuning
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-${NIC_ENV}
+ExecStart=${NIC_SCRIPT}
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+	mkdir -p "$PAQET_DROPIN" 2>/dev/null || true
+	cat > "${PAQET_DROPIN}/10-paqqet-perf.conf" << DROPEOF
+[Service]
+Nice=-10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+DROPEOF
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	systemctl enable --now paqqet-nic.service >/dev/null 2>&1 || bash "$NIC_SCRIPT" >/dev/null 2>&1 || true
+	log_ok "Deep optimization applied (sysctl + NIC + qdisc + RPS/XPS + service limits) and it survives reboot."
+	return 0
+}
+
+# apply_transport <inst> <profile> <mtu> <wnd> <conn> [cipher] [--no-restart]
+apply_transport() {
+	local inst="$1" prof="$2" mtu="$3" wnd="$4" conn="$5" cipher="${6:-}" norestart="${7:-}"
+	local cfg="${CONFIG_DIR}/${inst}.yaml" m="${META_DIR}/${inst}.meta" key tmp k
+	[[ -f "$cfg" ]] || { log_err "Config not found: ${cfg}"; return 1; }
+	valid_profile "$prof" || { log_err "Unknown profile: ${prof}"; return 1; }
+	valid_mtu "$mtu"     || { log_err "Bad MTU: ${mtu}"; return 1; }
+	valid_wnd "$wnd"     || { log_err "Bad window: ${wnd}"; return 1; }
+	valid_conn "$conn"   || { log_err "Bad conn: ${conn}"; return 1; }
+	key=$(grep -m1 -E '^[[:space:]]*key:' "$cfg" | sed -E 's/^[^"]*"//; s/".*$//')
+	[[ -n "$key" ]] || { log_err "Cannot read the key from ${cfg}."; return 1; }
+	[[ -n "$cipher" ]] && SEL_BLOCK="$cipher"
+	tmp=$(mktemp) || return 1
+	awk '/^[ \t]*kcp:[ \t]*$/ { exit } { print }' "$cfg" > "$tmp"
+	sed -i -E "s/^([ \t]*conn:).*/\1 ${conn}/" "$tmp"
+	kcp_block "$key" "$mtu" "$prof" "$wnd" >> "$tmp"
+	if ! validate_yaml "$tmp"; then
+		rm -f "$tmp"; log_err "The generated config did not validate, nothing was changed."; return 1
+	fi
+	cat "$tmp" > "$cfg"; rm -f "$tmp"; chmod 600 "$cfg" 2>/dev/null || true
+	if [[ -f "$m" ]]; then
+		sed -i -E "s/^MTU=.*/MTU=${mtu}/; s/^PROFILE=.*/PROFILE=${prof}/; s/^WND=.*/WND=${wnd}/; s/^CONN=.*/CONN=${conn}/; s/^BLOCK=.*/BLOCK=${SEL_BLOCK}/" "$m"
+		for k in "MTU=${mtu}" "PROFILE=${prof}" "WND=${wnd}" "CONN=${conn}" "BLOCK=${SEL_BLOCK}"; do
+			grep -q "^${k%%=*}=" "$m" || echo "$k" >> "$m"
+		done
+	fi
+	if [[ "$norestart" != "--no-restart" ]]; then
+		systemctl restart "paqet@${inst}" >/dev/null 2>&1 || true
+		sleep 2
+		if systemctl is-active --quiet "paqet@${inst}"; then
+			log_ok "Instance ${inst}: profile=${prof} mtu=${mtu} conn=${conn} window=${wnd} cipher=${SEL_BLOCK}"
+		else
+			log_warn "Instance ${inst} did not come back up - check: journalctl -u paqet@${inst} -n 40"
+		fi
+	fi
+	return 0
+}
+
+#--- 6. what the other server needs -------------------------------------------
+AP_SELF_URL="${PAQQET_SELF_URL:-https://raw.githubusercontent.com/xSOH3ILx/paQQet/main/paQQet.sh}"
+
+# peer_recipe <this-role> <inst> <ip> <port> <key> <mtu> <prof> <wnd> <conn> <cipher> <proto> <ports> [peer-name]
+peer_recipe() {
+	local role="$1" inst="$2" ip="$3" port="$4" key="$5" mtu="$6" prof="$7" wnd="$8" conn="$9"
+	local cipher="${10}" proto="${11}" ports="${12}" peer_name="${13:-}"
+	local f="${BACKUP_DIR}/paqqet-peer-${inst}.txt" cmd there
+	mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+	if [[ "$role" == "client" ]]; then
+		[[ -n "$peer_name" ]] || peer_name="ir"
+		there="EXIT node (server side, abroad)"
+		cmd="PAQQET_BLOCK=${cipher} paQQet server --name ${peer_name} --port ${port} --key ${key} --mtu ${mtu} --profile ${prof} --conn ${conn} --wnd ${wnd} --block ${cipher} --yes"
+	else
+		[[ -n "$peer_name" ]] || peer_name="$inst"
+		there="IRAN hub (client side)"
+		cmd="PAQQET_BLOCK=${cipher} paQQet client --name ${peer_name} --remote ${ip} --port ${port} --key ${key} --ports \"${ports:-2053}\" --proto ${proto} --mtu ${mtu} --profile ${prof} --conn ${conn} --wnd ${wnd} --yes"
+	fi
+	{
+		echo "paQQet ${SCRIPT_VERSION} - settings for the OTHER server (instance '${inst}')"
+		echo "generated $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+		echo
+		printf '  %-12s: %s\n' "that side" "$there"
+		printf '  %-12s: %s\n' "peer IP" "$ip"
+		printf '  %-12s: %s\n' "port" "$port"
+		printf '  %-12s: %s\n' "key" "$key"
+		printf '  %-12s: %s\n' "MTU" "$mtu"
+		printf '  %-12s: %s\n' "profile" "$prof"
+		printf '  %-12s: %s\n' "conn" "$conn"
+		printf '  %-12s: %s\n' "window" "$wnd"
+		printf '  %-12s: %s\n' "cipher" "$cipher"
+		printf '  %-12s: %s\n' "protocol" "$proto"
+		[[ -n "$ports" ]] && printf '  %-12s: %s\n' "ports" "$ports"
+		echo
+		echo "1) install paQQet + the core there:"
+		echo "     bash <(curl -fsSL ${AP_SELF_URL}) install"
+		echo "2) create the matching side (one line, copy it as it is):"
+		echo "     ${cmd}"
+		if [[ "$role" == "server" ]]; then
+			echo
+			echo "   --ports takes localport>remoteport pairs, e.g. 2053 or 8080>443 or 9000>10.0.0.5:9000"
+			echo "   (change it to the ports your panel really uses on the Iran hub)"
+		fi
+		echo
+		echo "IMPORTANT: key, MTU, profile, conn, window and cipher must be IDENTICAL on both sides,"
+		echo "otherwise the tunnel comes up but no traffic passes."
+	} > "$f"
+	chmod 600 "$f" 2>/dev/null || true
+	echo
+	echo -e "${BOLD}${GREEN}=========== COPY THIS TO THE OTHER SERVER ===========${NC}"
+	cat "$f"
+	echo -e "${BOLD}${GREEN}=====================================================${NC}"
+	log_ok "Saved as paqqet-peer-${inst}.txt in ${BACKUP_DIR} (${f})"
+	return 0
+}
+
+#--- 7. the auto-pilot ---------------------------------------------------------
+autopilot() {
+	local role ip inst port key ports proto myip np speed
+	need_root
+	[[ -x "$BIN_PATH" ]] || die "Install the paqet core first (menu option 1 / paQQet install)."
+	P_RTT=0; P_JIT=0; P_LOSS=0; P_MTU=0; P_ICMP=0; P_HOPS=0
+	P_TCP_STATE="unknown"; P_TCP_MS=0; P_PORT_STATE="unknown"; P_UDP_STATE="unknown"
+	BW_DOWN=0; BW_UP=0; BW_SRC="not measured"; PLAN_NOTES=()
+	echo
+	echo -e "${BOLD}${MAGENTA}AUTO-PILOT${NC} - I test this server and the route, then build the best tunnel."
+	detect_network_details
+	log_info "Step 1/5: reading hardware, kernel and NIC..."
+	hw_probe
+	role=$(ap_choose "Which side is THIS server?" "client" \
+		"client|Iran hub|users connect here, traffic leaves through the server abroad" \
+		"server|exit node|the server abroad that provides the internet")
+	if [[ "$role" == "client" ]]; then
+		ip=$(ask "Public IP of the EXIT server (abroad): " "")
+		valid_ipv4 "$ip" || die "Invalid IPv4 address: ${ip}"
+	else
+		ip=$(ask "Public IP of the IRAN hub (optional, only used to test the route): " "")
+		if [[ -n "$ip" ]]; then valid_ipv4 "$ip" || die "Invalid IPv4 address: ${ip}"; fi
+	fi
+	inst=$(ask "Instance name (letters/digits, e.g. de1) [tun1]: " "tun1")
+	valid_name "$inst" || die "Invalid instance name: ${inst}"
+	port=$(ask "Tunnel port [${DEF_EXIT_PORT}]: " "$DEF_EXIT_PORT")
+	valid_port "$port" || die "Invalid port: ${port}"
+	case "$port" in
+		22|53|80|443|8080|8443) ap_note "Port ${port} is a well known service port: DPI watches it and a real service may need it." ;;
+	esac
+	if [[ "$role" == "server" ]] && port_in_use "$port" tcp; then
+		np=$(free_port_from 9500) || np=""
+		if [[ -n "$np" ]]; then
+			log_warn "A real service already listens on ${port}; using ${np} instead."
+			port="$np"
+		fi
+	fi
+	key=$(ask "Shared key (Enter = generate a new one): " "")
+	if [[ -z "$key" ]]; then
+		key=$(gen_key)
+		log_info "A new key was generated; the other server must use exactly the same key."
+	fi
+	if [[ "$role" == "client" ]]; then
+		ports=$(ask "Local ports to forward (e.g. 2053 or 8080>443, comma separated) [2053]: " "2053")
+		proto=$(ap_choose "Which protocol should be forwarded?" "tcp" \
+			"tcp|tcp|panels, web, Xray TCP/WS/gRPC inbounds" \
+			"udp|udp|WireGuard, QUIC/Hysteria, DNS, game traffic" \
+			"both|both|TCP and UDP on the same ports")
+	else
+		ports=""; proto="tcp"
+	fi
+	PLAN_PROTO="$proto"
+	if [[ -n "$ip" ]]; then
+		log_info "Step 2/5: probing the route to ${ip}..."
+		path_probe "$ip" "$port"
+	else
+		log_warn "Step 2/5 skipped: without the peer IP the route cannot be measured, safe defaults are used."
+	fi
+	log_info "Step 3/5: line speed..."
+	bw_probe "$ip"
+	log_info "Step 4/5: computing the best transport..."
+	plan_config
+	ap_report
+	confirm "Build the tunnel with these settings now?" "y" || { log_warn "Cancelled, nothing was changed."; return 1; }
+	SEL_BLOCK="$PLAN_BLOCK"
+	log_info "Step 5/5: writing the configuration and starting the service..."
+	if [[ "$role" == "server" ]]; then
+		configure_server "$inst" "$port" "$key" "$PLAN_MTU" "$PLAN_PROFILE" "$PLAN_CONN" "$PLAN_WND"
+	else
+		reset_client_vars
+		C_NAME="$inst"; C_REMOTE="$ip"; C_PORT="$port"; C_KEY="$key"
+		C_PORTS="$ports"; C_PROTO="$proto"
+		C_MTU="$PLAN_MTU"; C_PROF="$PLAN_PROFILE"; C_CONN="$PLAN_CONN"; C_WND="$PLAN_WND"
+		configure_client
+	fi
+	if confirm "Apply the deep Linux/NIC optimization on this server too (recommended)?" "y"; then
+		speed=$BW_DOWN
+		(( BW_UP > speed )) && speed=$BW_UP
+		deep_optimize "$speed" "$AP_IFACE"
+	fi
+	myip="${PUBLIC_IP:-}"
+	valid_ipv4 "$myip" || myip="${DETECTED_IP:-}"
+	if [[ "$role" == "server" ]]; then
+		peer_recipe server "$inst" "$myip" "$port" "$key" "$PLAN_MTU" "$PLAN_PROFILE" "$PLAN_WND" "$PLAN_CONN" "$PLAN_BLOCK" "$proto" "$ports"
+	else
+		peer_recipe client "$inst" "$ip" "$port" "$key" "$PLAN_MTU" "$PLAN_PROFILE" "$PLAN_WND" "$PLAN_CONN" "$PLAN_BLOCK" "$proto" "$ports"
+	fi
+	log_info "When both sides are up, menu option 21 benchmarks the profiles and keeps the fastest one."
+	return 0
+}
+
+#--- 8. live benchmark ---------------------------------------------------------
+BENCH_IP=""
+
+# bench_measure <iperf3|socks|latency> <port> -> "<mbps> <rtt-ms>"
+bench_measure() {
+	local mode="$1" port="$2" mbps=0 rtt=0 out
+	case "$mode" in
+		iperf3)
+			if have iperf3 && [[ -n "$BENCH_IP" ]]; then
+				mbps=$(timeout 30 iperf3 -c "$BENCH_IP" -p "$port" -t 5 -P 4 -R 2>/dev/null | ap_iperf_mbps)
+			fi
+			;;
+		socks)
+			out=$(curl -fsS -o /dev/null --max-time 25 --socks5-hostname "127.0.0.1:${port}" -w '%{speed_download}' "https://speed.cloudflare.com/__down?bytes=30000000" 2>/dev/null)
+			mbps=$(( $(ap_int "${out:-0}") * 8 / 1000000 ))
+			;;
+	esac
+	mbps=$(ap_int "${mbps:-0}")
+	if [[ -n "$BENCH_IP" ]]; then
+		out=$(ping -n -c 10 -i 0.2 -W 2 "$BENCH_IP" 2>/dev/null | grep -E 'min/avg/max' | tail -n1)
+		if [[ -n "$out" ]]; then
+			out="${out##*= }"; out="${out% ms}"
+			rtt=$(ap_int "$(cut -d/ -f2 <<< "$out")")
+		fi
+	fi
+	echo "${mbps} ${rtt}"
+}
+
+benchmark_tunnel() {
+	local inst="${1:-}" mode port depth cur_key cur_mtu cur_conn cur_block
+	local prof wnd mbps rtt score best_score=-999999 best_prof="" best_wnd="" line
+	local -a profiles=() results=()
+	need_root
+	if [[ -z "$inst" ]]; then
+		inst=$(pick_instance) || return 1
+	fi
+	[[ -f "${CONFIG_DIR}/${inst}.yaml" ]] || { log_err "Instance ${inst} does not exist."; return 1; }
+	BENCH_IP=$(meta_get "$inst" REMOTE_IP)
+	cur_key=$(meta_get "$inst" KEY)
+	cur_mtu=$(meta_get "$inst" MTU); [[ -n "$cur_mtu" ]] || cur_mtu="$DEF_MTU"
+	cur_conn=$(meta_get "$inst" CONN); [[ -n "$cur_conn" ]] || cur_conn="$DEF_CONN"
+	cur_block=$(meta_get "$inst" BLOCK); [[ -n "$cur_block" ]] || cur_block="$DEF_BLOCK"
+	echo
+	echo -e "${BOLD}${MAGENTA}BENCHMARK${NC} - each profile is applied for a few seconds and measured, the winner stays."
+	log_warn "The tunnel restarts several times during the test, so users will see short drops."
+	mode=$(ap_choose "How should the speed be measured?" "socks" \
+		"iperf3|iperf3|needs 'iperf3 -s' on the other server - most accurate" \
+		"socks|through the tunnel|downloads through the local SOCKS5 port (client side)" \
+		"latency|ping only|no download, only RTT - for gaming/VoIP tuning")
+	case "$mode" in
+		iperf3) port=$(ask "iperf3 port on the other server [5201]: " "5201") ;;
+		socks)  port=$(ask "Local SOCKS5 port of this instance [1080]: " "1080") ;;
+		*)      port=0 ;;
+	esac
+	depth=$(ap_choose "How thorough should the test be?" "quick" \
+		"quick|quick|3 profiles, about 1 minute" \
+		"full|full|3 profiles x 2 window sizes, about 3 minutes")
+	profiles=(iran iran-max iran-game)
+	confirm "Start the benchmark on instance ${inst} now?" "y" || return 1
+	for prof in "${profiles[@]}"; do
+		for wnd in $(profile_sug_wnd "$prof") $( [[ "$depth" == "full" ]] && echo $(( $(profile_sug_wnd "$prof") * 2 )) ); do
+			(( wnd > 32768 )) && continue
+			log_info "Testing profile=${prof} window=${wnd} ..."
+			apply_transport "$inst" "$prof" "$cur_mtu" "$wnd" "$cur_conn" "$cur_block" >/dev/null 2>&1
+			sleep 3
+			read -r mbps rtt <<< "$(bench_measure "$mode" "$port")"
+			if [[ "$mode" == "latency" ]]; then
+				score=$(( 0 - rtt * 10 ))
+			else
+				score=$(( mbps * 10 - rtt * 2 ))
+			fi
+			results+=("$(printf '%-10s wnd=%-6s %6s Mbit  %5s ms  score=%s' "$prof" "$wnd" "$mbps" "$rtt" "$score")")
+			log_info "  -> ${mbps} Mbit, ${rtt} ms (score ${score})"
+			if (( score > best_score )); then
+				best_score=$score; best_prof="$prof"; best_wnd="$wnd"
+			fi
+		done
+	done
+	echo
+	echo -e "${BOLD}${BLUE}=============== BENCHMARK RESULT ===============${NC}"
+	for line in "${results[@]}"; do echo "  $line"; done
+	if [[ -z "$best_prof" ]]; then
+		log_err "No measurement succeeded - is the tunnel really up and the port correct?"
+		return 1
+	fi
+	echo -e "${BOLD}${GREEN}  Winner: profile ${best_prof} with window ${best_wnd} (score ${best_score})${NC}"
+	echo -e "${BOLD}${BLUE}================================================${NC}"
+	apply_transport "$inst" "$best_prof" "$cur_mtu" "$best_wnd" "$cur_conn" "$cur_block"
+	{
+		echo "paQQet ${SCRIPT_VERSION} benchmark - instance ${inst} - $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+		echo "mode=${mode} port=${port} mtu=${cur_mtu} conn=${cur_conn} cipher=${cur_block}"
+		for line in "${results[@]}"; do echo "  $line"; done
+		echo "winner: profile=${best_prof} window=${best_wnd} score=${best_score}"
+	} > "${BACKUP_DIR}/paqqet-bench-${inst}.txt"
+	log_ok "Report saved: ${BACKUP_DIR}/paqqet-bench-${inst}.txt"
+	log_warn "Apply the same profile and window on the other server, otherwise the tunnel stops passing traffic:"
+	peer_recipe "$(meta_get "$inst" ROLE)" "$inst" "${BENCH_IP:-${PUBLIC_IP:-0.0.0.0}}" "$(meta_get "$inst" PORT)" "$cur_key" "$cur_mtu" "$best_prof" "$best_wnd" "$cur_conn" "$cur_block" "$(meta_get "$inst" PROTO)" "$(meta_get "$inst" LOCAL_PORTS)"
+	return 0
+}
+
 show_banner() {
 	local core="not installed" ninst
 	[[ -x "$BIN_PATH" ]] && core="$("$BIN_PATH" version 2>/dev/null | sed -n '1p')"
@@ -1801,6 +2618,9 @@ menu() {
   15) Show panel ports (3X-UI/Xray) 16) Remove an instance
   17) Toggle strict firewall mode   18) Uninstall everything
   19) Re-tune an instance: profile / MTU / window / cipher
+  20) AUTO-PILOT: test the route + this server, then build the best tunnel
+  21) Benchmark the profiles on a live tunnel and keep the winner
+  22) Deep Linux/NIC optimization (sysctl, qdisc, RPS/XPS, buffers)
    0) Exit
 MEOF
 		local c; c=$(ask "$(echo -e "\n  ${BOLD}Choice:${NC} ")" "0")
@@ -1837,6 +2657,9 @@ MEOF
 			16) remove_instance ;;
 			17) toggle_strict ;;
 			19) retune_instance ;;
+			20) autopilot ;;
+			21) benchmark_tunnel ;;
+			22) deep_optimize ;;
 			18) uninstall_all; exit 0 ;;
 			0) exit 0 ;;
 			*) log_warn "Invalid choice." ;;
@@ -1871,6 +2694,9 @@ Commands:
   backup | restore <file>        Backup or restore the configuration
   remove <instance>              Delete one instance
   retune [name]                  Re-tune profile / MTU / window / cipher in place
+  auto           Auto-pilot: probe, plan, build and print the peer command
+  bench [name]   Benchmark the profiles on a live tunnel
+  deep-optimize  Deep Linux/NIC optimization
   uninstall                      Remove everything
   version | help
 
@@ -1962,6 +2788,9 @@ main() {
 		restore)        restore_backup "${1:-}" ;;
 		remove)         remove_instance "${1:-}" ;;
 		retune)         retune_instance "${1:-}" ;;
+		auto|autopilot) autopilot ;;
+		bench|benchmark) benchmark_tunnel "${1:-}" ;;
+		deep-optimize)  deep_optimize "${1:-0}" ;;
 		uninstall)      uninstall_all ;;
 		key)            show_instance_key "${1:-}" ;;
 		version|-v|--version) echo "paQQet ${SCRIPT_VERSION}" ;;
